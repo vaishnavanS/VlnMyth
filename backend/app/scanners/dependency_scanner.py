@@ -3,6 +3,7 @@ import json
 import xml.etree.ElementTree as ET
 import asyncio
 import httpx
+import os
 from typing import Dict, List, Any, Optional
 
 def clean_npm_version(ver_str: str) -> str:
@@ -295,4 +296,92 @@ async def scan_dependencies(files: Dict[str, str]) -> List[Dict[str, Any]]:
                     "version": dep["version"] or "unknown"
                 })
 
+    # Simplify and translate CVE explanations into student-friendly text
+    if findings:
+        explained_tasks = [explain_cve_finding(f) for f in findings]
+        findings = await asyncio.gather(*explained_tasks)
+
     return findings
+
+def clean_cve_explanation_fallback(details: str) -> str:
+    if not details:
+        return "No detailed description available."
+        
+    lines = details.splitlines()
+    cleaned_lines = []
+    
+    discard_sections = ["### details", "### poc", "### proof of concept", "### patches", "### workarounds", "### references", "## references"]
+    
+    for line in lines:
+        line_lower = line.lower().strip()
+        if any(sec in line_lower for sec in discard_sections):
+            break
+        if line_lower.startswith("### summary") or line_lower.startswith("### impact"):
+            parts = line.split(" ", 2)
+            if len(parts) > 2:
+                cleaned_lines.append(parts[2])
+            continue
+        cleaned_lines.append(line)
+        
+    cleaned_text = "\n".join(cleaned_lines).strip()
+    cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text)
+    
+    if not cleaned_text:
+        return details[:300] + "..." if len(details) > 300 else details
+        
+    return cleaned_text
+
+async def explain_cve_finding(finding: Dict[str, Any]) -> Dict[str, Any]:
+    title = finding.get("title", "")
+    package = finding.get("package", "unknown")
+    raw_explanation = finding.get("plain_explanation", "")
+    
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key or api_key.strip() == "" or api_key.startswith("your_"):
+        finding["plain_explanation"] = clean_cve_explanation_fallback(raw_explanation)
+        return finding
+        
+    try:
+        from groq import Groq
+        loop = asyncio.get_running_loop()
+        
+        def call_groq():
+            client = Groq(api_key=api_key)
+            system_prompt = (
+                "You are a friendly cybersecurity mentor for student developers. "
+                "Your task is to take a highly technical dependency vulnerability description (CVE) "
+                "and explain it in plain, simple English (no complex jargon). "
+                "Use a simple real-world analogy if helpful. "
+                "Keep the explanation brief (1-3 sentences) and highly encouraging. "
+                "Also provide a direct, simple recommendation on how to fix/remediate it (e.g. upgrading the package)."
+            )
+            user_content = (
+                f"Vulnerability Title: {title}\n"
+                f"Package: {package}\n"
+                f"Technical details:\n{raw_explanation}\n\n"
+                "Return a JSON object with these exact keys:\n"
+                "- plain_explanation (string)\n"
+                "- fix_suggestion (string)\n"
+            )
+            chat_completion = client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content}
+                ],
+                model="llama-3.3-70b-versatile",
+                temperature=0.2,
+                response_format={"type": "json_object"}
+            )
+            return chat_completion.choices[0].message.content.strip()
+            
+        result_str = await loop.run_in_executor(None, call_groq)
+        res = json.loads(result_str)
+        if "plain_explanation" in res:
+            finding["plain_explanation"] = res["plain_explanation"]
+        if "fix_suggestion" in res:
+            finding["fix_suggestion"] = res["fix_suggestion"]
+            
+    except Exception:
+        finding["plain_explanation"] = clean_cve_explanation_fallback(raw_explanation)
+        
+    return finding

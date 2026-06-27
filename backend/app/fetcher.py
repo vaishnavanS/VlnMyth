@@ -58,6 +58,61 @@ def fetch_codebase_from_git(repo_url: str) -> Tuple[Dict[str, str], str]:
         files_dict = read_files_from_dir(temp_dir)
         return files_dict, temp_dir
     except Exception as e:
+        # Try to fall back to a local directory with a matching name (e.g. for offline use)
+        try:
+            url_path = repo_url.rstrip('/')
+            if url_path.endswith('.git'):
+                url_path = url_path[:-4]
+            repo_name = url_path.split('/')[-1].lower()
+            
+            candidates = []
+            # Parents of this file
+            curr = os.path.abspath(__file__)
+            for _ in range(5):
+                curr = os.path.dirname(curr)
+                if curr and curr not in candidates:
+                    candidates.append(curr)
+            # Parents of CWD
+            curr = os.path.abspath(os.getcwd())
+            for _ in range(4):
+                curr = os.path.dirname(curr)
+                if curr and curr not in candidates:
+                    candidates.append(curr)
+                    
+            local_repo_path = None
+            for parent in candidates:
+                if not os.path.isdir(parent):
+                    continue
+                for entry in os.listdir(parent):
+                    if entry.lower() == repo_name:
+                        full_path = os.path.join(parent, entry)
+                        if os.path.isdir(full_path):
+                            local_repo_path = full_path
+                            break
+                if local_repo_path:
+                    break
+                    
+            if local_repo_path:
+                os.makedirs(temp_dir, exist_ok=True)
+                
+                def ignore_patterns(path, names):
+                    ignored = []
+                    for name in names:
+                        if name in EXCLUDE_DIRS or name in EXCLUDE_FILES or name.startswith('.'):
+                            ignored.append(name)
+                        else:
+                            _, ext = os.path.splitext(name.lower())
+                            if ext in BINARY_EXTENSIONS:
+                                ignored.append(name)
+                    return ignored
+                    
+                shutil.copytree(local_repo_path, temp_dir, dirs_exist_ok=True, ignore=ignore_patterns)
+                files_dict = read_files_from_dir(temp_dir)
+                if files_dict:
+                    return files_dict, temp_dir
+        except Exception as fallback_err:
+            pass
+            
         # Cleanup if failed
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)

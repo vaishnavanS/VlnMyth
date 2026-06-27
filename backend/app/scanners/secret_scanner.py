@@ -12,7 +12,7 @@ SECRET_PATTERNS = {
     "JWT Token": (re.compile(r'\b(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)\b'), "high"),
     "Database URL": (re.compile(r'\b((?:mysql|postgres|mongodb|redis)://[^\s\'"\)]+)\b'), "high"),
     "Hardcoded Password": (re.compile(r'(?i)\bpassword\s*=\s*[\'"]([^\'"]{6,})[\'"]'), "high"),
-    "Generic API Key": (re.compile(r'\b((?:sk|pk)-[a-zA-Z0-9_\-]{20,60})\b|(?i)\b(?:api_key|apikey)\s*=\s*[\'"]([a-zA-Z0-9_\-]{6,})[\'"]'), "high")
+    "Generic API Key": (re.compile(r'(?i)\b((?:sk|pk)-[a-zA-Z0-9_\-]{20,60})\b|\b(?:api_key|apikey)\s*=\s*[\'"]([a-zA-Z0-9_\-]{6,})[\'"]'), "high")
 }
 
 def mask_value(val: str) -> str:
