@@ -27,6 +27,10 @@ class AnalyzerState(TypedDict):
     bug_detector_raw: str
     misconfig_raw: str
     
+    # Scanner findings
+    cve_findings: List[Dict[str, Any]]
+    secret_findings: List[Dict[str, Any]]
+    
     # Summarized/Aggregated findings
     explained_findings: List[Dict[str, Any]]
     
@@ -45,6 +49,12 @@ class Finding(BaseModel):
     title: str
     plain_explanation: str
     fix_suggestion: str
+    source: Optional[str] = None
+    type: Optional[str] = None
+    masked_value: Optional[str] = None
+    cve_id: Optional[str] = None
+    package: Optional[str] = None
+    version: Optional[str] = None
 
 # Helper to load API keys and determine if we are in mock/demo mode
 def check_api_keys() -> Dict[str, bool]:

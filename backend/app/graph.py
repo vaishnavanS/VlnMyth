@@ -195,39 +195,44 @@ def explain_findings_node(state: AnalyzerState) -> Dict[str, Any]:
         "logs": logs
     }
 
+# --- Node 5.5: System Scanners ---
+async def scanners_node(state: AnalyzerState) -> Dict[str, Any]:
+    logs = list(state.get("logs", []))
+    logs.append("System Scanners: Starting dependency CVE and secrets scanning in parallel...")
+    
+    files = state["files"]
+    
+    from app.scanners.dependency_scanner import scan_dependencies
+    from app.scanners.secret_scanner import scan_secrets
+    
+    # scan_dependencies is async
+    cve_task = scan_dependencies(files)
+    # scan_secrets is sync, run in executor
+    loop = asyncio.get_running_loop()
+    secret_task = loop.run_in_executor(None, scan_secrets, files)
+    
+    cve_findings, secret_findings = await asyncio.gather(cve_task, secret_task)
+    
+    logs.append(f"System Scanners: Completed scanning. Found {len(cve_findings)} CVEs and {len(secret_findings)} secrets.")
+    return {
+        "cve_findings": cve_findings,
+        "secret_findings": secret_findings,
+        "logs": logs
+    }
+
 # --- Node 6: Report Generator ---
 def generate_report_node(state: AnalyzerState) -> Dict[str, Any]:
     logs = list(state.get("logs", []))
     logs.append("Report Generator Agent: Formatting final JSON report and determining severities...")
     
     explained = state.get("explained_findings", [])
-    if not explained:
-        logs.append("Report Generator Agent: No findings to format.")
-        return {"final_report": [], "logs": logs}
-        
-    mock = is_mock_mode()
-    if mock:
-        # Our explainer already outputs the desired format for demo purposes
-        # Let's clean the JSON schema to match the requested format
-        cleaned_report = []
-        for item in explained:
-            cleaned_report.append({
-                "file": item.get("file", "unknown"),
-                "line_number": int(item.get("line_number", 1)),
-                "severity": item.get("severity", "medium").lower(),
-                "title": item.get("title", "Security Flaw"),
-                "plain_explanation": item.get("plain_explanation", ""),
-                "fix_suggestion": item.get("fix_suggestion", "")
-            })
-        final_report = cleaned_report
-    else:
-        try:
-            logs.append("Report Generator Agent: Ordering findings with Llama...")
-            report_str = call_live_report_generator(explained, files=state.get("files"))
-            final_report = json.loads(report_str)
-        except Exception as e:
-            logs.append(f"Report Generator Agent Error: {str(e)}. Applying rule-based formatting.")
-            # Fallback format
+    agent_findings = []
+    
+    if explained:
+        mock = is_mock_mode()
+        if mock:
+            # Our explainer already outputs the desired format for demo purposes
+            # Let's clean the JSON schema to match the requested format
             cleaned_report = []
             for item in explained:
                 cleaned_report.append({
@@ -238,9 +243,48 @@ def generate_report_node(state: AnalyzerState) -> Dict[str, Any]:
                     "plain_explanation": item.get("plain_explanation", ""),
                     "fix_suggestion": item.get("fix_suggestion", "")
                 })
-            final_report = cleaned_report
+            agent_findings = cleaned_report
+        else:
+            try:
+                logs.append("Report Generator Agent: Ordering findings with Llama...")
+                report_str = call_live_report_generator(explained, files=state.get("files"))
+                agent_findings = json.loads(report_str)
+            except Exception as e:
+                logs.append(f"Report Generator Agent Error: {str(e)}. Applying rule-based formatting.")
+                # Fallback format
+                cleaned_report = []
+                for item in explained:
+                    cleaned_report.append({
+                        "file": item.get("file", "unknown"),
+                        "line_number": int(item.get("line_number", 1)),
+                        "severity": item.get("severity", "medium").lower(),
+                        "title": item.get("title", "Security Flaw"),
+                        "plain_explanation": item.get("plain_explanation", ""),
+                        "fix_suggestion": item.get("fix_suggestion", "")
+                    })
+                agent_findings = cleaned_report
             
-    logs.append(f"Report Generator Agent: Outputting final report containing {len(final_report)} issues.")
+    # Tag agent findings with source
+    for item in agent_findings:
+        item["source"] = "agent"
+        item["type"] = "agent"
+        
+    # Retrieve scanner findings
+    cve_findings = state.get("cve_findings", [])
+    secret_findings = state.get("secret_findings", [])
+    
+    # Ensure they have correct tags
+    for item in cve_findings:
+        item["source"] = "scanner"
+        item["type"] = "cve"
+    for item in secret_findings:
+        item["source"] = "scanner"
+        item["type"] = "secret"
+        
+    final_report = agent_findings + cve_findings + secret_findings
+    
+    logs.append(f"Report Generator Agent: Outputting final report containing {len(final_report)} issues "
+                f"({len(agent_findings)} agent, {len(cve_findings)} CVE, {len(secret_findings)} secrets).")
     return {
         "final_report": final_report,
         "logs": logs
@@ -251,6 +295,7 @@ def create_analyzer_graph() -> StateGraph:
     workflow = StateGraph(AnalyzerState)
     
     # Add Nodes
+    workflow.add_node("scanners", scanners_node)
     workflow.add_node("orchestrator", orchestrate_codebase_node)
     workflow.add_node("vuln_hunter", vuln_hunter_node)
     workflow.add_node("bug_detector", bug_detector_node)
@@ -259,7 +304,10 @@ def create_analyzer_graph() -> StateGraph:
     workflow.add_node("report_generator", generate_report_node)
     
     # Set entry point
-    workflow.set_entry_point("orchestrator")
+    workflow.set_entry_point("scanners")
+    
+    # Scanners routes to Orchestrator
+    workflow.add_edge("scanners", "orchestrator")
     
     # Orchestrator forks parallel specialist agents
     workflow.add_edge("orchestrator", "vuln_hunter")

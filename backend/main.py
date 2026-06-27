@@ -98,6 +98,8 @@ async def analyze_repository(
             "vuln_hunter_raw": "",
             "bug_detector_raw": "",
             "misconfig_raw": "",
+            "cve_findings": [],
+            "secret_findings": [],
             "explained_findings": [],
             "final_report": [],
             "logs": ["System: Source code loaded. Total files: " + str(len(files))],
