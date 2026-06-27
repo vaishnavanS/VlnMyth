@@ -223,7 +223,7 @@ def generate_report_node(state: AnalyzerState) -> Dict[str, Any]:
     else:
         try:
             logs.append("Report Generator Agent: Ordering findings with Llama...")
-            report_str = call_live_report_generator(explained)
+            report_str = call_live_report_generator(explained, files=state.get("files"))
             final_report = json.loads(report_str)
         except Exception as e:
             logs.append(f"Report Generator Agent Error: {str(e)}. Applying rule-based formatting.")

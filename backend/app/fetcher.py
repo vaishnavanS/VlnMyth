@@ -4,7 +4,6 @@ import tempfile
 import zipfile
 import re
 from typing import Dict, List, Tuple
-import git
 
 # Common directories and files to exclude from analysis to save tokens and focus on source code
 EXCLUDE_DIRS = {
@@ -48,9 +47,14 @@ def fetch_codebase_from_git(repo_url: str) -> Tuple[Dict[str, str], str]:
     """Clones the repo into a temporary folder, walks it, and returns file contents."""
     temp_dir = tempfile.mkdtemp(prefix="vulnlens_git_")
     try:
+        import subprocess
         clean_url = clean_github_url(repo_url)
-        # Clone with depth=1 to speed up and save space
-        git.Repo.clone_from(clean_url, temp_dir, depth=1)
+        result = subprocess.run(
+            ["git", "clone", "--depth=1", clean_url, temp_dir],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode != 0:
+            raise Exception(result.stderr)
         files_dict = read_files_from_dir(temp_dir)
         return files_dict, temp_dir
     except Exception as e:

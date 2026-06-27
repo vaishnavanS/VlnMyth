@@ -1,6 +1,6 @@
 # VulnLens Pro
 
-An AI-powered multi-agent code security scanning application built with FastAPI and React. It orchestrates multiple AI agents (using Google Gemini, Groq/Llama-3.3, Nvidia NIM/Nemotron, Together AI/Mixtral, and Claude Haiku) through a compiled **LangGraph** flow to identify vulnerabilities, logic bugs, and misconfigurations, translating raw outputs into plain, jargon-free English for students.
+An AI-powered multi-agent code security scanning application built with FastAPI and React. It orchestrates multiple AI agents (using Google Gemini, Groq/Llama-3.3, Nvidia NIM/Nemotron, and Together AI/Mixtral) through a compiled **LangGraph** flow to identify vulnerabilities, logic bugs, and misconfigurations, translating raw outputs into plain, jargon-free English for students.
 
 ## Agent Pipeline Workflow
 
@@ -11,11 +11,12 @@ graph TD
     C -->|Auth, DB, routes| D[Vuln Hunter: Llama-3.3 Groq]
     C -->|Logic & Helpers| E[Bug Detector: Nemotron Nvidia NIM]
     C -->|Config & Env| F[Misconfig Agent: Mixtral Together AI]
-    D --> G[Explainer Agent: Claude Haiku]
+    D --> G[Explainer Agent: Llama-3.3 Groq]
     E --> G
     F --> G
     G --> H[Report Generator: Llama-3.3 Groq]
     H --> I[React Frontend Dashboard]
+    I -->|Chat with AI Mentor| J[AI Security Mentor Chat: Llama-3.3 Groq]
 ```
 
 ## Features

@@ -1,10 +1,13 @@
 import os
 import shutil
+import uuid
+import json
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
-from typing import List, Optional
+from typing import List, Optional, Dict
 from dotenv import load_dotenv
+from groq import Groq
 
 # Load environmental variables early
 load_dotenv()
@@ -14,6 +17,9 @@ from app.graph import create_analyzer_graph
 from app.models import check_api_keys
 
 app = FastAPI(title="VulnLens Pro Backend", version="1.0.0")
+
+# In-memory store mapping session_id -> { files, final_report, app_summary }
+sessions_db = {}
 
 # Enable CORS for frontend interaction
 app.add_middleware(
@@ -26,6 +32,11 @@ app.add_middleware(
 
 class AnalyzeRequest(BaseModel):
     repo_url: str
+
+class ChatRequest(BaseModel):
+    session_id: str
+    message: str
+    conversation_history: List[Dict[str, str]]
 
 @app.get("/health")
 def health_check():
@@ -104,7 +115,16 @@ async def analyze_repository(
         if final_state.get("error"):
             raise HTTPException(status_code=500, detail=final_state["error"])
             
+        # Store codebase and report details in-memory for chat history context
+        session_id = str(uuid.uuid4())
+        sessions_db[session_id] = {
+            "files": files,
+            "final_report": final_state.get("final_report", []),
+            "app_summary": final_state.get("app_summary", "")
+        }
+            
         return {
+            "session_id": session_id,
             "summary": final_state.get("app_summary", ""),
             "categorization": final_state.get("categorization", {}),
             "logs": final_state.get("logs", []),
@@ -124,3 +144,99 @@ async def analyze_repository(
 
 # Import asyncio for ainvoke runtime
 import asyncio
+
+@app.post("/chat")
+async def chat_handler(request: ChatRequest):
+    session_id = request.session_id
+    message = request.message
+    conversation_history = request.conversation_history
+    
+    # 1. Check if Groq API Key is missing
+    api_status = check_api_keys()
+    if not api_status.get("GROQ_API_KEY"):
+        return {
+            "reply": "Chat requires the Groq API key. Please configure GROQ_API_KEY in the backend to enable the AI Security Mentor."
+        }
+        
+    # 2. Check if session exists
+    if session_id not in sessions_db:
+        raise HTTPException(status_code=404, detail="Session not found. Please run a scan first.")
+        
+    session_data = sessions_db[session_id]
+    files = session_data.get("files", {})
+    final_report = session_data.get("final_report", [])
+    app_summary = session_data.get("app_summary", "")
+    
+    # 3. Build condensed view of repository files
+    condensed_files_list = []
+    for fn, content in files.items():
+        lines = content.splitlines()
+        truncated_lines = lines[:60]
+        is_truncated = len(lines) > 60
+        file_content = "\n".join(truncated_lines)
+        if is_truncated:
+            file_content += "\n... [truncated to first 60 lines]"
+        condensed_files_list.append(f"### File: {fn}\n{file_content}\n")
+        
+    condensed_files_str = "\n".join(condensed_files_list)
+    
+    # Limit findings to the 10 most severe
+    severity_order = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+    sorted_report = sorted(
+        final_report,
+        key=lambda x: severity_order.get(str(x.get("severity", "low")).lower(), 0),
+        reverse=True
+    )
+    limited_report = sorted_report[:10]
+    report_str = json.dumps(limited_report, indent=2)
+    
+    # 4. Build system prompt
+    system_prompt = f"""You are a friendly security mentor for student developers. Act as a supportive, encouraging teacher.
+Your goal is to:
+- Answer questions about the security scan findings and issues detected in their codebase.
+- Explain vulnerabilities, bugs, or misconfigurations in simple, non-jargon language using analogies if helpful.
+- Suggest direct code fixes (provide code snippets when useful) and guide them on how to write secure code.
+
+Keep your explanations clear, simple, and jargon-free, as the user is a student developer learning security concepts.
+
+Here is the context about the analyzed codebase project:
+1. Application Summary:
+{app_summary}
+
+2. Full Scan Report (Findings):
+{report_str}
+
+3. Condensed Codebase Files (truncated to first 60 lines each):
+{condensed_files_str}
+"""
+    
+    # 5. Format messages for Groq API
+    messages = [{"role": "system", "content": system_prompt}]
+    for turn in conversation_history:
+        role = turn.get("role")
+        content = turn.get("content")
+        if role in ["user", "assistant"] and content:
+            messages.append({"role": role, "content": content})
+            
+    # Append the current message
+    messages.append({"role": "user", "content": message})
+    
+    try:
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        loop = asyncio.get_running_loop()
+        
+        def call_groq():
+            return client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                temperature=0.3
+            )
+            
+        response = await loop.run_in_executor(None, call_groq)
+        reply = response.choices[0].message.content
+        return {"reply": reply}
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to communicate with Groq API: {str(e)}")

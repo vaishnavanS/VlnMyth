@@ -242,6 +242,12 @@ def run_mock_explainer(raw_findings: List[Dict[str, Any]]) -> List[Dict[str, Any
 
 # --- Live API Client Calls ---
 
+def truncate_file_content(content: str, max_lines: int = 150) -> str:
+    lines = content.splitlines()
+    if len(lines) > max_lines:
+        return "\n".join(lines[:max_lines]) + "\n... [truncated]"
+    return content
+
 # 1. Orchestrator using Google Gemini
 def call_live_orchestrator(files: Dict[str, str]) -> Dict[str, Any]:
     genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
@@ -290,13 +296,31 @@ Do not include any markdown styling, code block wrapper, or extra text. Return O
 def call_live_vuln_hunter(files: Dict[str, str], assigned_files: List[str]) -> str:
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     
-    # Build contents block for assigned files
-    code_content = []
+    # 1. Truncate files to 150 lines
+    truncated_files = {}
     for f in assigned_files:
         if f in files:
-            code_content.append(f"### FILE: {f} ###\n{files[f]}\n")
-    
-    context = "\n".join(code_content)
+            truncated_files[f] = truncate_file_content(files[f], 150)
+            
+    # 2. Batch files if the combined content exceeds 24000 characters
+    batches = []
+    current_batch = []
+    current_length = 0
+    for f in assigned_files:
+        if f in truncated_files:
+            file_repr = f"### FILE: {f} ###\n{truncated_files[f]}\n"
+            file_len = len(file_repr)
+            if current_length + file_len > 24000 and current_batch:
+                batches.append(current_batch)
+                current_batch = [f]
+                current_length = file_len
+            else:
+                current_batch.append(f)
+                current_length += file_len
+    if current_batch:
+        batches.append(current_batch)
+        
+    all_findings = []
     
     system_prompt = """You are Vuln Hunter, an expert web application security research agent.
 Your specialty is identifying security vulnerabilities: SQL injection, XSS, RCE, IDOR, SSRF, authentication bypass, path traversal, CSRF, insecure deserialization, etc.
@@ -319,21 +343,35 @@ Return the findings as a JSON list. Example:
 ]
 Do not include any conversational filler, markdown formatting (like ```json), or extra text. Output ONLY the JSON array. If no vulnerabilities are found, return []."""
 
-    chat_completion = client.chat.completions.create(
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Analyze the following codebase files:\n\n{context}"}
-        ],
-        model="llama-3.3-70b-versatile",
-        temperature=0.1,
-    )
-    
-    result = chat_completion.choices[0].message.content.strip()
-    if "```json" in result:
-        result = result.split("```json")[1].split("```")[0].strip()
-    elif "```" in result:
-        result = result.split("```")[1].split("```")[0].strip()
-    return result
+    for batch in batches:
+        code_content = []
+        for f in batch:
+            code_content.append(f"### FILE: {f} ###\n{truncated_files[f]}\n")
+        context = "\n".join(code_content)
+        
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Analyze the following codebase files:\n\n{context}"}
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.1,
+        )
+        
+        result = chat_completion.choices[0].message.content.strip()
+        if "```json" in result:
+            result = result.split("```json")[1].split("```")[0].strip()
+        elif "```" in result:
+            result = result.split("```")[1].split("```")[0].strip()
+            
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, list):
+                all_findings.extend(parsed)
+        except Exception as e:
+            print(f"Error parsing JSON from Vuln Hunter: {e}. Output was: {result}")
+            
+    return json.dumps(all_findings, indent=2)
 
 # 3. Specialist: Bug Detector (Nvidia NIM / llama-3.1-nemotron-70b-instruct)
 def call_live_bug_detector(files: Dict[str, str], assigned_files: List[str]) -> str:
@@ -343,12 +381,31 @@ def call_live_bug_detector(files: Dict[str, str], assigned_files: List[str]) -> 
         api_key=os.getenv("NVIDIA_API_KEY")
     )
     
-    code_content = []
+    # 1. Truncate files to 150 lines
+    truncated_files = {}
     for f in assigned_files:
         if f in files:
-            code_content.append(f"### FILE: {f} ###\n{files[f]}\n")
+            truncated_files[f] = truncate_file_content(files[f], 150)
             
-    context = "\n".join(code_content)
+    # 2. Batch files if the combined content exceeds 24000 characters
+    batches = []
+    current_batch = []
+    current_length = 0
+    for f in assigned_files:
+        if f in truncated_files:
+            file_repr = f"### FILE: {f} ###\n{truncated_files[f]}\n"
+            file_len = len(file_repr)
+            if current_length + file_len > 24000 and current_batch:
+                batches.append(current_batch)
+                current_batch = [f]
+                current_length = file_len
+            else:
+                current_batch.append(f)
+                current_length += file_len
+    if current_batch:
+        batches.append(current_batch)
+        
+    all_findings = []
     
     system_prompt = """You are Bug Detector, an expert software developer and static code analyzer.
 Your specialty is finding logic bugs, null pointer exceptions, unhandled exceptions/rejections, race conditions, memory leaks, resource leaks, or structural issues.
@@ -371,21 +428,36 @@ Return the findings as a JSON list. Example:
 ]
 Do not include any conversational filler, markdown formatting (like ```json), or extra text. Output ONLY the JSON array. If no bugs are found, return []."""
 
-    completion = client.chat.completions.create(
-        model="meta/llama-3.1-nemotron-70b-instruct",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Analyze the following codebase files:\n\n{context}"}
-        ],
-        temperature=0.1,
-    )
-    
-    result = completion.choices[0].message.content.strip()
-    if "```json" in result:
-        result = result.split("```json")[1].split("```")[0].strip()
-    elif "```" in result:
-        result = result.split("```")[1].split("```")[0].strip()
-    return result
+    for batch in batches:
+        code_content = []
+        for f in batch:
+            code_content.append(f"### FILE: {f} ###\n{truncated_files[f]}\n")
+            
+        context = "\n".join(code_content)
+        
+        completion = client.chat.completions.create(
+            model="meta/llama-3.1-nemotron-70b-instruct",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Analyze the following codebase files:\n\n{context}"}
+            ],
+            temperature=0.1,
+        )
+        
+        result = completion.choices[0].message.content.strip()
+        if "```json" in result:
+            result = result.split("```json")[1].split("```")[0].strip()
+        elif "```" in result:
+            result = result.split("```")[1].split("```")[0].strip()
+            
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, list):
+                all_findings.extend(parsed)
+        except Exception as e:
+            print(f"Error parsing JSON from Bug Detector: {e}. Output was: {result}")
+            
+    return json.dumps(all_findings, indent=2)
 
 # 4. Specialist: Misconfig Agent (Together AI / Mixtral-8x7B-Instruct-v0.1)
 def call_live_misconfig(files: Dict[str, str], assigned_files: List[str]) -> str:
@@ -395,12 +467,31 @@ def call_live_misconfig(files: Dict[str, str], assigned_files: List[str]) -> str
         api_key=os.getenv("TOGETHER_API_KEY")
     )
     
-    code_content = []
+    # 1. Truncate files to 150 lines
+    truncated_files = {}
     for f in assigned_files:
         if f in files:
-            code_content.append(f"### FILE: {f} ###\n{files[f]}\n")
+            truncated_files[f] = truncate_file_content(files[f], 150)
             
-    context = "\n".join(code_content)
+    # 2. Batch files if the combined content exceeds 24000 characters
+    batches = []
+    current_batch = []
+    current_length = 0
+    for f in assigned_files:
+        if f in truncated_files:
+            file_repr = f"### FILE: {f} ###\n{truncated_files[f]}\n"
+            file_len = len(file_repr)
+            if current_length + file_len > 24000 and current_batch:
+                batches.append(current_batch)
+                current_batch = [f]
+                current_length = file_len
+            else:
+                current_batch.append(f)
+                current_length += file_len
+    if current_batch:
+        batches.append(current_batch)
+        
+    all_findings = []
     
     system_prompt = """You are Misconfig Agent, a devops and infrastructure security expert.
 Your specialty is detecting hardcoded secrets/API keys, .env file exposure, permissive CORS, missing security headers, unsafe Dockerfile policies, insecure cookies, and insecure system settings.
@@ -423,34 +514,45 @@ Return the findings as a JSON list. Example:
 ]
 Do not include any conversational filler, markdown formatting (like ```json), or extra text. Output ONLY the JSON array. If no issues are found, return []."""
 
-    completion = client.chat.completions.create(
-        model="mistralai/Mixtral-8x7B-Instruct-v0.1",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Analyze the following codebase files:\n\n{context}"}
-        ],
-        temperature=0.1,
-    )
-    
-    result = completion.choices[0].message.content.strip()
-    if "```json" in result:
-        result = result.split("```json")[1].split("```")[0].strip()
-    elif "```" in result:
-        result = result.split("```")[1].split("```")[0].strip()
-    return result
+    for batch in batches:
+        code_content = []
+        for f in batch:
+            code_content.append(f"### FILE: {f} ###\n{truncated_files[f]}\n")
+            
+        context = "\n".join(code_content)
+        
+        completion = client.chat.completions.create(
+            model="mistralai/Mixtral-8x7B-Instruct-v0.1",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Analyze the following codebase files:\n\n{context}"}
+            ],
+            temperature=0.1,
+        )
+        
+        result = completion.choices[0].message.content.strip()
+        if "```json" in result:
+            result = result.split("```json")[1].split("```")[0].strip()
+        elif "```" in result:
+            result = result.split("```")[1].split("```")[0].strip()
+            
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, list):
+                all_findings.extend(parsed)
+        except Exception as e:
+            print(f"Error parsing JSON from Misconfig Agent: {e}. Output was: {result}")
+            
+    return json.dumps(all_findings, indent=2)
 
-# 5. Explainer Agent (Anthropic / Claude Haiku 4.5)
-# Note: claude-haiku-4-5 is specified. To ensure API compatibility, we will use the anthropic SDK and model "claude-3-5-haiku-20241022" or "claude-3-haiku-20240307".
+# 5. Explainer Agent (Groq / Llama 3.3 70B)
 def call_live_explainer(raw_findings: List[Dict[str, Any]]) -> str:
-    client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     
-    prompt = f"""You are Explainer Agent, a cybersecurity mentor who teaches college students.
+    system_prompt = """You are Explainer Agent, a cybersecurity mentor who teaches college students.
 Your job is to take raw security findings, bugs, or misconfigurations and explain them in plain English.
 CRITICAL: Do not use complex cybersecurity jargon. If you must use a term, explain it with a simple analogy (e.g. SQL Injection is like a lock pick, XSS is like someone sneaking their own sign onto a bulletin board).
 Target audience: college students who do not know cybersecurity.
-
-Here is the JSON list of raw findings:
-{json.dumps(raw_findings, indent=2)}
 
 For each finding, you must provide:
 1. file: the file path
@@ -459,18 +561,22 @@ For each finding, you must provide:
 4. plain_explanation: explaining what the problem is and why it is dangerous in plain English.
 5. fix_suggestion: a simple, direct instruction on how to fix it.
 
-Format your output as a raw JSON list. Do not write anything else. Return ONLY the JSON.
+Format your output as a raw JSON list. Do not write anything else. Return ONLY the JSON."""
+
+    prompt = f"""Here is the JSON list of raw findings:
+{json.dumps(raw_findings, indent=2)}
 """
     
-    response = client.messages.create(
-        model="claude-3-5-haiku-20241022",
-        max_tokens=4000,
+    chat_completion = client.chat.completions.create(
         messages=[
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
-        ]
+        ],
+        model="llama-3.3-70b-versatile",
+        temperature=0.1,
     )
     
-    result = response.content[0].text.strip()
+    result = chat_completion.choices[0].message.content.strip()
     if "```json" in result:
         result = result.split("```json")[1].split("```")[0].strip()
     elif "```" in result:
@@ -478,10 +584,34 @@ Format your output as a raw JSON list. Do not write anything else. Return ONLY t
     return result
 
 # 6. Report Generator (Groq/Llama-3.3-70b-versatile)
-def call_live_report_generator(explained_findings: List[Dict[str, Any]]) -> str:
+def call_live_report_generator(explained_findings: List[Dict[str, Any]], files: Optional[Dict[str, str]] = None) -> str:
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     
-    prompt = f"""You are the Report Generator.
+    # 1. Truncate files to 150 lines if passed
+    if files:
+        truncated_files = {k: truncate_file_content(v, 150) for k, v in files.items()}
+        
+    # 2. Batch findings if the combined json string content exceeds 24000 characters
+    batches = []
+    current_batch = []
+    current_length = 0
+    for finding in explained_findings:
+        finding_str = json.dumps(finding)
+        finding_len = len(finding_str)
+        if current_length + finding_len > 24000 and current_batch:
+            batches.append(current_batch)
+            current_batch = [finding]
+            current_length = finding_len
+        else:
+            current_batch.append(finding)
+            current_length += finding_len
+    if current_batch:
+        batches.append(current_batch)
+        
+    all_reports = []
+    
+    for batch in batches:
+        prompt = f"""You are the Report Generator.
 Your job is to take the explained findings and organize them into a clean, structured JSON report.
 For each finding, you must determine its severity (must be one of: "critical", "high", "medium", "low").
 The final JSON must be an array of objects, where each object has these exact keys:
@@ -493,21 +623,29 @@ The final JSON must be an array of objects, where each object has these exact ke
 - "fix_suggestion" (string)
 
 Here are the explained findings:
-{json.dumps(explained_findings, indent=2)}
+{json.dumps(batch, indent=2)}
 
 Return ONLY the raw JSON list of findings. Do not include markdown code block wrappers (```json) or conversational text."""
 
-    completion = client.chat.completions.create(
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
-        model="llama-3.3-70b-versatile",
-        temperature=0.1,
-    )
-    
-    result = completion.choices[0].message.content.strip()
-    if "```json" in result:
-        result = result.split("```json")[1].split("```")[0].strip()
-    elif "```" in result:
-        result = result.split("```")[1].split("```")[0].strip()
-    return result
+        completion = client.chat.completions.create(
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.1,
+        )
+        
+        result = completion.choices[0].message.content.strip()
+        if "```json" in result:
+            result = result.split("```json")[1].split("```")[0].strip()
+        elif "```" in result:
+            result = result.split("```")[1].split("```")[0].strip()
+            
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, list):
+                all_reports.extend(parsed)
+        except Exception as e:
+            print(f"Error parsing JSON from Report Generator: {e}. Output was: {result}")
+            
+    return json.dumps(all_reports, indent=2)
